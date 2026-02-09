@@ -167,15 +167,15 @@ class App(tk.Tk):
         ttk.Entry(db_frame, textvariable=self.db_port_var, width=14).grid(row=5, column=1, sticky="w", **pad)
 
         ttk.Label(db_frame, text="Пользователь:").grid(row=6, column=0, sticky="e", **pad)
-        self.db_user_var = tk.StringVar(value="root")
+        self.db_user_var = tk.StringVar(value="")
         ttk.Entry(db_frame, textvariable=self.db_user_var, width=14).grid(row=6, column=1, sticky="w", **pad)
 
         ttk.Label(db_frame, text="Пароль:").grid(row=7, column=0, sticky="e", **pad)
-        self.db_pass_var = tk.StringVar(value="123456")
+        self.db_pass_var = tk.StringVar(value="")
         ttk.Entry(db_frame, textvariable=self.db_pass_var, width=14, show="*").grid(row=7, column=1, sticky="w", **pad)
 
         ttk.Label(db_frame, text="База:").grid(row=8, column=0, sticky="e", **pad)
-        self.db_name_var = tk.StringVar(value="astanavision")
+        self.db_name_var = tk.StringVar(value="")
         ttk.Entry(db_frame, textvariable=self.db_name_var, width=14).grid(row=8, column=1, sticky="w", **pad)
 
         self.process_existing_var = tk.BooleanVar(value=False)
