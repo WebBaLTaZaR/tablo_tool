@@ -14,6 +14,14 @@ try:
 except Exception:
     pymysql = None
 
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except Exception:
+    pystray = None
+    Image = None
+    ImageDraw = None
+
 
 DELIMITER = 0xF0
 DEFAULT_BAUD = 9600
@@ -64,11 +72,15 @@ class App(tk.Tk):
         self.text_mode_var = tk.StringVar(value="queue_num_4")
         self.addr_map = {}
         self.map_path = self._get_map_path()
+        self._tray = None
+        self._tray_thread = None
 
         self._apply_theme()
         self._build_ui()
         self._refresh_ports()
         self._load_map()
+        self.protocol("WM_DELETE_WINDOW", self.on_exit)
+        self.after(300, self._auto_start)
 
     def _apply_theme(self):
         style = ttk.Style(self)
@@ -126,6 +138,15 @@ class App(tk.Tk):
             "TCombobox",
             padding=4,
         )
+
+    def _auto_start(self):
+        # Auto-start DB monitoring on launch
+        try:
+            self.on_db_start()
+        except Exception:
+            pass
+        # Minimize to tray after start
+        self.after(300, self._hide_to_tray)
 
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
@@ -468,6 +489,93 @@ class App(tk.Tk):
                 self.status_var.set("Serial error.")
                 return
             time.sleep(delay)
+
+    def _all_known_addresses(self):
+        addrs = set()
+        for v in self.addr_map.values():
+            try:
+                v = int(v)
+                if 0 < v < 255 and v != DELIMITER:
+                    addrs.add(v)
+            except Exception:
+                pass
+        for info in self._db_active.values():
+            try:
+                v = int(info.get("addr"))
+                if 0 < v < 255 and v != DELIMITER:
+                    addrs.add(v)
+            except Exception:
+                pass
+        return sorted(addrs)
+
+    def _shutdown_clear_all(self):
+        # Best-effort clear for all known addresses
+        try:
+            port = self.port_var.get()
+            for addr in self._all_known_addresses():
+                frame = build_blank(addr)
+                send_bytes(port, frame)
+        except Exception:
+            pass
+
+    def on_exit(self):
+        # Stop DB thread
+        self._db_stop.set()
+        # Clear all tablos
+        self._shutdown_clear_all()
+        # Stop tray icon
+        if self._tray:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+        self.destroy()
+
+    def _create_tray_image(self):
+        if Image is None or ImageDraw is None:
+            return None
+        img = Image.new("RGB", (64, 64), "#F4F1EC")
+        d = ImageDraw.Draw(img)
+        d.rectangle((8, 10, 56, 54), outline="#2E2A25", width=3)
+        d.text((16, 24), "TB", fill="#2E2A25")
+        return img
+
+    def _hide_to_tray(self):
+        if pystray is None:
+            # Fallback: just minimize
+            self.iconify()
+            return
+        if self._tray is not None:
+            self.withdraw()
+            return
+
+        def on_show(icon, item):
+            self.after(0, self._restore_from_tray)
+
+        def on_exit(icon, item):
+            self.after(0, self.on_exit)
+
+        icon_image = self._create_tray_image()
+        menu = pystray.Menu(
+            pystray.MenuItem("Показать", on_show),
+            pystray.MenuItem("Выход", on_exit),
+        )
+        self._tray = pystray.Icon("tablo_tool", icon_image, "Tablo", menu)
+
+        def _run_tray():
+            try:
+                self._tray.run()
+            except Exception:
+                pass
+
+        self._tray_thread = threading.Thread(target=_run_tray, daemon=True)
+        self._tray_thread.start()
+        self.withdraw()
+
+    def _restore_from_tray(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
 
 
 if __name__ == "__main__":
