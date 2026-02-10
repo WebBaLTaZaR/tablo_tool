@@ -5,6 +5,8 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox
+import ctypes
+from ctypes import wintypes
 
 import serial
 import serial.tools.list_ports
@@ -75,6 +77,7 @@ class App(tk.Tk):
         self.settings_path = self._get_settings_path()
         self._tray = None
         self._tray_thread = None
+        self._cred_target = "tablo_tool:db_password"
 
         self._apply_theme()
         self._build_ui()
@@ -275,8 +278,92 @@ class App(tk.Tk):
         base = os.path.dirname(sys.argv[0] if getattr(sys, "frozen", False) else __file__)
         return os.path.join(base, "tablo_settings.ini")
 
+    def _cred_read(self, target):
+        try:
+            advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+            CredReadW = advapi.CredReadW
+            CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+            CredReadW.restype = wintypes.BOOL
+            CredFree = advapi.CredFree
+            CredFree.argtypes = [ctypes.c_void_p]
+            CredFree.restype = None
+
+            pcred = ctypes.c_void_p()
+            if not CredReadW(target, 1, 0, ctypes.byref(pcred)):
+                return None
+
+            class CREDENTIAL(ctypes.Structure):
+                _fields_ = [
+                    ("Flags", wintypes.DWORD),
+                    ("Type", wintypes.DWORD),
+                    ("TargetName", wintypes.LPWSTR),
+                    ("Comment", wintypes.LPWSTR),
+                    ("LastWritten", wintypes.FILETIME),
+                    ("CredentialBlobSize", wintypes.DWORD),
+                    ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+                    ("Persist", wintypes.DWORD),
+                    ("AttributeCount", wintypes.DWORD),
+                    ("Attributes", ctypes.c_void_p),
+                    ("TargetAlias", wintypes.LPWSTR),
+                    ("UserName", wintypes.LPWSTR),
+                ]
+
+            cred = ctypes.cast(pcred, ctypes.POINTER(CREDENTIAL)).contents
+            blob = ctypes.string_at(cred.CredentialBlob, cred.CredentialBlobSize)
+            CredFree(pcred)
+            return blob.decode("utf-16-le", errors="ignore")
+        except Exception:
+            return None
+
+    def _cred_write(self, target, secret):
+        try:
+            advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+            CredWriteW = advapi.CredWriteW
+            CredWriteW.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+            CredWriteW.restype = wintypes.BOOL
+
+            class CREDENTIAL(ctypes.Structure):
+                _fields_ = [
+                    ("Flags", wintypes.DWORD),
+                    ("Type", wintypes.DWORD),
+                    ("TargetName", wintypes.LPWSTR),
+                    ("Comment", wintypes.LPWSTR),
+                    ("LastWritten", wintypes.FILETIME),
+                    ("CredentialBlobSize", wintypes.DWORD),
+                    ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+                    ("Persist", wintypes.DWORD),
+                    ("AttributeCount", wintypes.DWORD),
+                    ("Attributes", ctypes.c_void_p),
+                    ("TargetAlias", wintypes.LPWSTR),
+                    ("UserName", wintypes.LPWSTR),
+                ]
+
+            blob = secret.encode("utf-16-le")
+            credential = CREDENTIAL()
+            credential.Flags = 0
+            credential.Type = 1  # CRED_TYPE_GENERIC
+            credential.TargetName = target
+            credential.Comment = None
+            credential.CredentialBlobSize = len(blob)
+            credential.CredentialBlob = ctypes.cast(ctypes.create_string_buffer(blob), ctypes.POINTER(ctypes.c_byte))
+            credential.Persist = 2  # CRED_PERSIST_LOCAL_MACHINE
+            credential.AttributeCount = 0
+            credential.Attributes = None
+            credential.TargetAlias = None
+            credential.UserName = "tablo_tool"
+
+            if not CredWriteW(ctypes.byref(credential), 0):
+                return False
+            return True
+        except Exception:
+            return False
+
     def _load_settings(self):
         if not os.path.exists(self.settings_path):
+            # still try to read password from Credential Manager
+            saved = self._cred_read(self._cred_target)
+            if saved:
+                self.db_pass_var.set(saved)
             return
         cfg = configparser.ConfigParser()
         cfg.read(self.settings_path, encoding="utf-8")
@@ -284,8 +371,11 @@ class App(tk.Tk):
             self.db_host_var.set(cfg["db"].get("host", self.db_host_var.get()))
             self.db_port_var.set(cfg["db"].get("port", self.db_port_var.get()))
             self.db_user_var.set(cfg["db"].get("user", self.db_user_var.get()))
-            self.db_pass_var.set(cfg["db"].get("password", self.db_pass_var.get()))
+            # password is stored in Windows Credential Manager
             self.db_name_var.set(cfg["db"].get("database", self.db_name_var.get()))
+        saved = self._cred_read(self._cred_target)
+        if saved:
+            self.db_pass_var.set(saved)
         if "app" in cfg:
             self.process_existing_var.set(cfg["app"].getboolean("process_existing", False))
             self.db_poll_var.set(cfg["app"].get("poll", self.db_poll_var.get()))
@@ -297,7 +387,6 @@ class App(tk.Tk):
             "host": self.db_host_var.get(),
             "port": self.db_port_var.get(),
             "user": self.db_user_var.get(),
-            "password": self.db_pass_var.get(),
             "database": self.db_name_var.get(),
         }
         cfg["app"] = {
@@ -307,6 +396,8 @@ class App(tk.Tk):
         }
         with open(self.settings_path, "w", encoding="utf-8") as f:
             cfg.write(f)
+        if self.db_pass_var.get():
+            self._cred_write(self._cred_target, self.db_pass_var.get())
 
     def _load_map(self):
         self.addr_map = {}
