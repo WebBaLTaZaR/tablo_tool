@@ -72,6 +72,7 @@ class App(tk.Tk):
         self.text_mode_var = tk.StringVar(value="queue_num_4")
         self.addr_map = {}
         self.map_path = self._get_map_path()
+        self.settings_path = self._get_settings_path()
         self._tray = None
         self._tray_thread = None
 
@@ -79,6 +80,7 @@ class App(tk.Tk):
         self._build_ui()
         self._refresh_ports()
         self._load_map()
+        self._load_settings()
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
         self.after(300, self._auto_start)
 
@@ -269,6 +271,43 @@ class App(tk.Tk):
         base = os.path.dirname(sys.argv[0] if getattr(sys, "frozen", False) else __file__)
         return os.path.join(base, "tablo_map.ini")
 
+    def _get_settings_path(self):
+        base = os.path.dirname(sys.argv[0] if getattr(sys, "frozen", False) else __file__)
+        return os.path.join(base, "tablo_settings.ini")
+
+    def _load_settings(self):
+        if not os.path.exists(self.settings_path):
+            return
+        cfg = configparser.ConfigParser()
+        cfg.read(self.settings_path, encoding="utf-8")
+        if "db" in cfg:
+            self.db_host_var.set(cfg["db"].get("host", self.db_host_var.get()))
+            self.db_port_var.set(cfg["db"].get("port", self.db_port_var.get()))
+            self.db_user_var.set(cfg["db"].get("user", self.db_user_var.get()))
+            self.db_pass_var.set(cfg["db"].get("password", self.db_pass_var.get()))
+            self.db_name_var.set(cfg["db"].get("database", self.db_name_var.get()))
+        if "app" in cfg:
+            self.process_existing_var.set(cfg["app"].getboolean("process_existing", False))
+            self.db_poll_var.set(cfg["app"].get("poll", self.db_poll_var.get()))
+            self.port_var.set(cfg["app"].get("com_port", self.port_var.get()))
+
+    def _save_settings(self):
+        cfg = configparser.ConfigParser()
+        cfg["db"] = {
+            "host": self.db_host_var.get(),
+            "port": self.db_port_var.get(),
+            "user": self.db_user_var.get(),
+            "password": self.db_pass_var.get(),
+            "database": self.db_name_var.get(),
+        }
+        cfg["app"] = {
+            "process_existing": str(self.process_existing_var.get()),
+            "poll": self.db_poll_var.get(),
+            "com_port": self.port_var.get(),
+        }
+        with open(self.settings_path, "w", encoding="utf-8") as f:
+            cfg.write(f)
+
     def _load_map(self):
         self.addr_map = {}
         if not os.path.exists(self.map_path):
@@ -303,9 +342,12 @@ class App(tk.Tk):
             messagebox.showerror("Error", "pymysql is not installed. Install it first.")
             return
         try:
+            if not self.db_user_var.get() or not self.db_name_var.get():
+                raise ValueError("Заполните Пользователь и База")
             poll = float(self.db_poll_var.get())
             if poll < 0.1:
                 raise ValueError("Poll must be >= 0.1 seconds")
+            self._save_settings()
             self._db_stop.clear()
             self._db_thread = threading.Thread(target=self._db_worker, daemon=True)
             self._db_thread.start()
