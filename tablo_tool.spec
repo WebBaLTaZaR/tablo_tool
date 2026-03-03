@@ -1,8 +1,8 @@
-# -*- mode: python ; coding: utf-8 -*-
+﻿# -*- mode: python ; coding: utf-8 -*-
 
 
 a = Analysis(
-    ['D:\\Users\\Сергей\\Desktop\\ТАБЛО\\tablo_tool.py'],
+    ['tablo_tool.py'],
     pathex=[],
     binaries=[],
     datas=[],
