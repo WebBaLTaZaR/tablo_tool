@@ -346,13 +346,7 @@ class App(tk.Tk):
         ttk.Label(test_frame, text=f"Карта: {self.map_path}").grid(row=9, column=0, columnspan=2, sticky="w", **pad)
         ttk.Button(test_frame, text="Перезагрузить", command=self._load_map).grid(row=9, column=2, **pad)
 
-        self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(frm, textvariable=self.status_var).grid(row=1, column=0, columnspan=3, sticky="w", **pad)
-
-        self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(frm, textvariable=self.status_var).grid(row=1, column=0, columnspan=3, sticky="w", **pad)
-
-        self.status_var = tk.StringVar(value="Ready.")
+        self.status_var = tk.StringVar(value="Готово.")
         ttk.Label(frm, textvariable=self.status_var).grid(row=1, column=0, columnspan=3, sticky="w", **pad)
 
 
@@ -504,14 +498,14 @@ class App(tk.Tk):
                 cfg["map"] = {"1": "1"}
                 with open(self.map_path, "w", encoding="utf-8") as f:
                     cfg.write(f)
-                self.status_var.set("Map created (tablo_map.ini).")
+                self.status_var.set("Файл карты создан (tablo_map.ini).")
             except Exception:
-                self.status_var.set("Map not found, using cabinet_id directly.")
+                self.status_var.set("Карта не найдена, используется cabinet_id напрямую.")
             return
         cfg = configparser.ConfigParser()
         cfg.read(self.map_path, encoding="utf-8")
         if "map" not in cfg:
-            self.status_var.set("Map section missing, using cabinet_id directly.")
+            self.status_var.set("Секция map не найдена, используется cabinet_id напрямую.")
             return
         for k, v in cfg["map"].items():
             try:
@@ -521,7 +515,7 @@ class App(tk.Tk):
                     self.addr_map[cab] = addr
             except Exception:
                 continue
-        self.status_var.set(f"Map loaded: {len(self.addr_map)} entries.")
+        self.status_var.set(f"Карта загружена: {len(self.addr_map)} записей.")
 
     def _protocol_id(self):
         return PROTOCOL_LABELS.get(self.protocol_label_var.get(), PROTOCOL_RS485)
@@ -542,14 +536,14 @@ class App(tk.Tk):
         if self._db_thread and self._db_thread.is_alive():
             return
         if pymysql is None:
-            messagebox.showerror("Error", "pymysql is not installed. Install it first.")
+            messagebox.showerror("Error", "pymysql не установлен. Установите его.")
             return
         try:
             if not self.db_user_var.get() or not self.db_name_var.get():
                 raise ValueError("Заполните Пользователь и База")
             poll = float(self.db_poll_var.get())
             if poll < 0.1:
-                raise ValueError("Poll must be >= 0.1 seconds")
+                raise ValueError("Интервал должен быть не меньше 0.1 с")
             self._save_settings()
             self._db_stop.clear()
             self._db_thread = threading.Thread(target=self._db_worker, daemon=True)
@@ -573,11 +567,14 @@ class App(tk.Tk):
             autocommit=True,
         )
 
+
+
     def _db_worker(self):
-        # Read-only monitor: only SELECT queries
+        # Read-only monitor. Source of truth for active calls is queue.
         addr_field = self.addr_by_var.get()
         text_mode = self.text_mode_var.get()
         poll = float(self.db_poll_var.get())
+        initialized = False
 
         def make_text(prefix, queue_num):
             if text_mode == "prefix+3" and prefix:
@@ -588,72 +585,95 @@ class App(tk.Tk):
             try:
                 with self._db_connect() as conn:
                     with conn.cursor() as cur:
-                        # Build operator mapping: orders_list.oper_id -> operators.id
-                        cur.execute("SELECT id, operator_id FROM operators")
-                        op_map = {int(op_id): int(op_db_id) for op_db_id, op_id in cur.fetchall()}
-
-                        # Initialize last id if needed
-                        if self._last_orders_id == 0 and not self.process_existing_var.get():
-                            cur.execute("SELECT IFNULL(MAX(id),0) FROM orders_list")
-                            self._last_orders_id = int(cur.fetchone()[0])
-
-                        # Fetch new orders
                         cur.execute(
-                            "SELECT id, oper_id, queue_num, prefix, zone_id, cabinet_id, room_id "
-                            "FROM orders_list WHERE id > %s ORDER BY id ASC",
-                            (self._last_orders_id,),
+                            "SELECT id, operator_id, cabinet_id, room_id, zone_id "
+                            "FROM operators"
                         )
-                        rows = cur.fetchall()
-                        for row in rows:
-                            order_id, oper_id, queue_num, prefix, zone_id, cabinet_id, room_id = row
-                        rows = cur.fetchall()
-                        for row in rows:
-                            order_id, oper_id, queue_num, prefix, zone_id, cabinet_id, room_id = row
-                            self._last_orders_id = max(self._last_orders_id, int(order_id))
+                        operators = {
+                            int(op_db_id): {
+                                "operator_id": int(operator_id or 0),
+                                "cabinet_id": int(cabinet_id or 0),
+                                "room_id": int(room_id or 0),
+                                "zone_id": int(zone_id or 0),
+                            }
+                            for op_db_id, operator_id, cabinet_id, room_id, zone_id in cur.fetchall()
+                        }
 
-                            operator_db_id = op_map.get(int(oper_id))
-                            if operator_db_id is None:
+                        cur.execute(
+                            "SELECT id, queue_num, operator_id, prefix, finished, cancelled, time_call "
+                            "FROM queue "
+                            "WHERE date_check = CURDATE() AND operator_id > 0 "
+                            "ORDER BY id ASC"
+                        )
+                        latest_by_operator = {}
+                        for queue_id, queue_num, operator_db_id, prefix, finished, cancelled, time_call in cur.fetchall():
+                            operator_db_id = int(operator_db_id or 0)
+                            if operator_db_id <= 0:
+                                continue
+                            if int(finished or 0) == 1 or int(cancelled or 0) == 1:
+                                continue
+                            # For redirected tickets, target operator row can exist before actual call.
+                            # Show only after actual call (time_call is set).
+                            if time_call is None:
+                                continue
+                            latest_by_operator[operator_db_id] = {
+                                "queue_id": int(queue_id),
+                                "queue_num": int(queue_num or 0),
+                                "prefix": prefix or "",
+                            }
+
+                        current_active = {}
+                        for operator_db_id, queue_info in latest_by_operator.items():
+                            op_info = operators.get(operator_db_id)
+                            if not op_info:
                                 continue
                             addr_source = {
-                                "zone_id": zone_id,
-                                "cabinet_id": cabinet_id,
-                                "room_id": room_id,
-                                "oper_id": oper_id,
-                            }.get(addr_field, zone_id)
-                            if addr_field == "cabinet_id" and cabinet_id:
-                                addr_source = self.addr_map.get(int(cabinet_id), int(cabinet_id))
+                                "zone_id": op_info["zone_id"],
+                                "cabinet_id": op_info["cabinet_id"],
+                                "room_id": op_info["room_id"],
+                                "oper_id": op_info["operator_id"],
+                            }.get(addr_field, op_info["zone_id"])
+                            if addr_field == "cabinet_id" and op_info["cabinet_id"]:
+                                addr_source = self.addr_map.get(op_info["cabinet_id"], op_info["cabinet_id"])
                             if addr_source is None:
                                 continue
+                            current_active[operator_db_id] = {
+                                "queue_id": queue_info["queue_id"],
+                                "queue_num": queue_info["queue_num"],
+                                "addr": int(addr_source),
+                                "text": make_text(queue_info["prefix"], queue_info["queue_num"]),
+                            }
 
-                            text = make_text(prefix, queue_num)
+                        if not initialized and not self.process_existing_var.get():
+                            self._db_active = current_active
+                            initialized = True
+                            self.status_var.set(f"DB активные: {len(self._db_active)}")
+                            time.sleep(poll)
+                            continue
+
+                        initialized = True
+
+                        for operator_db_id, info in current_active.items():
+                            prev = self._db_active.get(operator_db_id)
+                            if prev and prev.get("queue_id") == info["queue_id"]:
+                                continue
                             try:
-                                display_value = text if self._protocol_id() == PROTOCOL_RS485 else int(queue_num)
-                                self._send_display(int(addr_source), display_value, False)
-                                self._db_active[(operator_db_id, int(queue_num))] = {
-                                    "addr": int(addr_source),
-                                    "text": text,
-                                }
+                                display_value = info["text"] if self._protocol_id() == PROTOCOL_RS485 else int(info["queue_num"])
+                                self._send_display(int(info["addr"]), display_value, False)
+                            except Exception:
+                                continue
+                            self._db_active[operator_db_id] = info
+
+                        for operator_db_id, prev in list(self._db_active.items()):
+                            if operator_db_id in current_active:
+                                if current_active[operator_db_id].get("queue_id") == prev.get("queue_id"):
+                                    continue
+                            try:
+                                self._send_clear(int(prev["addr"]))
                             except Exception:
                                 pass
-
-                        if self._db_active:
-                            for (operator_db_id, queue_num), info in list(self._db_active.items()):
-                                cur.execute(
-                                    "SELECT finished, cancelled FROM queue "
-                                    "WHERE operator_id=%s AND queue_num=%s "
-                                    "ORDER BY id DESC LIMIT 1",
-                                    (operator_db_id, queue_num),
-                                )
-                                row = cur.fetchone()
-                                if not row:
-                                    continue
-                                finished, cancelled = row
-                                if int(finished) == 1 or int(cancelled) == 1:
-                                    try:
-                                        self._send_clear(int(info["addr"]))
-                                    except Exception:
-                                        pass
-                                    self._db_active.pop((operator_db_id, queue_num), None)
+                            if operator_db_id not in current_active:
+                                self._db_active.pop(operator_db_id, None)
 
                 self.status_var.set(f"DB активные: {len(self._db_active)}")
             except Exception:
@@ -695,13 +715,13 @@ class App(tk.Tk):
         if self._protocol_id() == PROTOCOL_RS485:
             rs485_send(self.port_var.get(), build_rs485_frame(addr, self._normalize_rs485_text(str(value)), blink))
             return
-        rek_com_send(self.port_var.get(), build_rek_com_frame(addr, self._normalize_rek_number(value)))
+        rek_com_send(self.port_var.get(), build_rek_com_frame(addr, self._normalize_rek_number(value)), repeat=1)
 
     def _send_clear(self, addr: int):
         if self._protocol_id() == PROTOCOL_RS485:
             rs485_send(self.port_var.get(), build_rs485_blank(addr))
             return
-        rek_com_send(self.port_var.get(), build_rek_com_clear(addr))
+        rek_com_send(self.port_var.get(), build_rek_com_clear(addr), repeat=1)
 
     def on_test_send(self):
         try:
